@@ -8,14 +8,89 @@ const AITrainer = require('../models/AiTrainer')
 
 const getAI = () => {
   if (!process.env.GEMINI_API_KEY) {
-    throw new Error(
-      'GEMINI_API_KEY .env faylda topilmadi'
-    )
+    throw new Error('GEMINI_API_KEY .env faylda topilmadi')
   }
 
   return new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY,
   })
+}
+
+// ============================================================
+// GEMINI MODEL FALLBACK
+// ============================================================
+
+const AI_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.5-flash',
+]
+
+const isTemporaryGeminiError = (error) => {
+  const status = error?.status
+
+  return (
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504
+  )
+}
+
+const generateWithFallback = async (
+  ai,
+  contents,
+  config = undefined,
+  options = {}
+) => {
+  const { logPrefix = 'Gemini' } = options
+
+  let lastError = null
+
+  for (const model of AI_MODELS) {
+    try {
+      console.log(`${logPrefix}: trying model ${model}`)
+
+      const request = {
+        model,
+        contents,
+      }
+
+      if (config) {
+        request.config = config
+      }
+
+      const response =
+        await ai.models.generateContent(request)
+
+      console.log(
+        `${logPrefix}: success with ${model}`
+      )
+
+      return response
+    } catch (error) {
+      lastError = error
+
+      console.error(
+        `${logPrefix}: ${model} failed`,
+        {
+          status: error?.status,
+          message: error?.message,
+        }
+      )
+
+      if (!isTemporaryGeminiError(error)) {
+        throw error
+      }
+
+      console.log(
+        `${logPrefix}: trying next model...`
+      )
+    }
+  }
+
+  throw lastError
 }
 
 // ============================================================
@@ -139,18 +214,27 @@ When uncertain, provide the most reasonable estimate based on the visible portio
 
 If the food is an Uzbek or Central Asian dish, use realistic nutritional assumptions for the typical preparation of that dish.
 
-Return:
+Return ONLY valid JSON.
 
-1. detected food name
-2. estimated visible portion
-3. estimated calories in kcal
-4. estimated protein in grams
-5. estimated carbohydrates in grams
-6. estimated fat in grams
+Do NOT use Markdown.
+Do NOT use code fences.
+Do NOT add explanations outside JSON.
+Do NOT include percentages.
 
-All nutrition values must be numbers.
+Nutrition values must be numeric.
+Calories must represent the visible portion.
+Do not provide a daily calorie target.
 
-The portion field must be a short human-readable string.
+Return exactly this structure:
+
+{
+  "name": "Plov / Osh",
+  "portion": "approximately 300 g",
+  "calories": 520,
+  "protein": 18,
+  "carbs": 62,
+  "fat": 21
+}
 
 ${
   foodName
@@ -164,35 +248,12 @@ If the image clearly shows something different, prioritize the visual evidence.
 `
     : ''
 }
-
-IMPORTANT OUTPUT RULES:
-
-- Return ONLY valid JSON.
-- Do NOT use Markdown.
-- Do NOT use code fences.
-- Do NOT add explanations outside JSON.
-- Do NOT include percentages.
-- Nutrition values must be numeric.
-- Calories must represent the visible portion.
-- Do not provide a daily calorie target.
-
-Return exactly this structure:
-
-{
-  "name": "Plov / Osh",
-  "portion": "approximately 300 g",
-  "calories": 520,
-  "protein": 18,
-  "carbs": 62,
-  "fat": 21
-}
 `
 
     const response =
-      await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-
-        contents: [
+      await generateWithFallback(
+        ai,
+        [
           {
             inlineData: {
               mimeType,
@@ -201,7 +262,11 @@ Return exactly this structure:
           },
           prompt,
         ],
-      })
+        undefined,
+        {
+          logPrefix: 'AI Food Scanner',
+        }
+      )
 
     const rawText =
       response.text?.trim()
@@ -237,7 +302,8 @@ Return exactly this structure:
         JSON.parse(cleanJson)
     } catch (parseError) {
       console.error(
-        'Gemini JSON parse error'
+        'Gemini JSON parse error:',
+        parseError
       )
 
       return res.status(500).json({
@@ -340,6 +406,7 @@ exports.chatWithAI = async (
 
     if (
       !message ||
+      typeof message !== 'string' ||
       !message.trim()
     ) {
       return res.status(400).json({
@@ -352,12 +419,10 @@ exports.chatWithAI = async (
     const ai = getAI()
 
     const response =
-      await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-
-        contents: message,
-
-        config: {
+      await generateWithFallback(
+        ai,
+        message.trim(),
+        {
           systemInstruction: `
 You are the AI assistant inside the INTIZOM AI application.
 
@@ -392,7 +457,10 @@ If the user asks about a serious medical problem, recommend speaking with a qual
 The user may be a teenager, so avoid restrictive dieting and aggressive weight-loss advice.
 `,
         },
-      })
+        {
+          logPrefix: 'AI Chat',
+        }
+      )
 
     return res.status(200).json({
       success: true,
@@ -432,24 +500,6 @@ exports.getTrainerPlan = async (
           'AI Trainer uchun login qilish kerak',
       })
     }
-
-    /*
-     * IMPORTANT:
-     *
-     * AI Trainer endi:
-     * - weight
-     * - height
-     * - age
-     * - gender
-     * - calorie target
-     * - water target
-     * - BMR
-     *
-     * asosida ishlamaydi.
-     *
-     * Frontenddan faqat umumiy fitness
-     * preference yuborilishi mumkin.
-     */
 
     const {
       fitnessLevel,
@@ -571,12 +621,14 @@ Return only the plan text.
 `
 
     const response =
-      await ai.models.generateContent({
-        model:
-          'gemini-3.8-flash',
-
-        contents: prompt,
-      })
+      await generateWithFallback(
+        ai,
+        prompt,
+        undefined,
+        {
+          logPrefix: 'AI Trainer',
+        }
+      )
 
     const plan =
       response.text?.trim() || ''
@@ -589,19 +641,11 @@ Return only the plan text.
       })
     }
 
-    /*
-     * Eski body-metric ma'lumotlarini
-     * yangi AI Trainer documentiga
-     * saqlamaymiz.
-     *
-     * Faqat umumiy preference + plan.
-     */
     const savedTrainer =
       await AITrainer.findOneAndUpdate(
         {
           user: userId,
         },
-
         {
           $set: {
             user: userId,
@@ -626,16 +670,7 @@ Return only the plan text.
             lastGeneratedAt:
               new Date(),
           },
-
-          /*
-           * Eski schema fieldlari mavjud
-           * bo‘lsa ham ularni yangilamaymiz.
-           *
-           * Agar schema'da strict mode ishlayotgan
-           * bo‘lsa, modelni ham keyin moslashtiramiz.
-           */
         },
-
         {
           new: true,
           upsert: true,
