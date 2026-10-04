@@ -35,14 +35,7 @@ exports.register = async (req, res) => {
       });
     }
 
-    const existingUser = await User.findOne({ name });
-
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'Bu ism allaqachon ro‘yxatdan o‘tgan',
-      });
-    }
+    const cleanName = name.trim();
 
     const userHeight =
       height !== undefined && height !== ''
@@ -61,9 +54,9 @@ exports.register = async (req, res) => {
     );
 
     // User yaratish
-    // Bu yerda BMR yoki dailyGoalCalories hisoblanmaydi.
+    // Bir xil ismli userlarga ruxsat beriladi.
     const user = await User.create({
-      name: name.trim(),
+      name: cleanName,
       password: hashedPassword,
       age: Number(age),
       weight: Number(weight),
@@ -111,32 +104,40 @@ exports.login = async (req, res) => {
       });
     }
 
-    const user = await User.findOne({
-      name: name.trim(),
+    const cleanName = name.trim();
+
+    // Bir xil ismli barcha userlarni topamiz
+    const users = await User.find({
+      name: cleanName,
     });
 
-    if (!user) {
+    if (!users || users.length === 0) {
       return res.status(401).json({
         success: false,
         message: 'Ism yoki parol xato',
       });
     }
 
-    // Eski MongoDB userlarida password bo‘lmasligi mumkin.
-    if (!user.password) {
-      return res.status(401).json({
-        success: false,
-        message:
-          'Bu akkauntda parol mavjud emas. Yangi akkaunt yarating.',
-      });
+    // Shu ismli userlar orasidan paroli mos kelganini topamiz
+    let user = null;
+
+    for (const currentUser of users) {
+      if (!currentUser.password) {
+        continue;
+      }
+
+      const passwordCorrect = await bcrypt.compare(
+        password,
+        currentUser.password
+      );
+
+      if (passwordCorrect) {
+        user = currentUser;
+        break;
+      }
     }
 
-    const passwordCorrect = await bcrypt.compare(
-      password,
-      user.password
-    );
-
-    if (!passwordCorrect) {
+    if (!user) {
       return res.status(401).json({
         success: false,
         message: 'Ism yoki parol xato',
@@ -225,10 +226,6 @@ exports.updateProfile = async (req, res) => {
       );
     }
 
-    // Muhim:
-    // Bu yerda BMR, dailyGoalCalories,
-    // water target yoki macro target hisoblanmaydi.
-
     await user.save();
 
     return res.status(200).json({
@@ -261,8 +258,7 @@ exports.updateProfile = async (req, res) => {
 // Barcha userlar
 exports.getAllUsers = async (req, res) => {
   try {
-    const users = await User.find()
-      .select('-password');
+    const users = await User.find().select('-password');
 
     return res.status(200).json({
       success: true,
