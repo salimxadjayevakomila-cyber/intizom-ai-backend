@@ -11,6 +11,7 @@ const stepRoutes = require('./routes/stepRoutes'); // <--- Step Counter uchun qo
 const gymRoutes = require('./routes/gymRoutes');
 const goalRoutes = require('./routes/goalRoutes');
 const insightRoutes = require('./routes/insightRoutes')
+const notificationRoutes = require('./routes/notificationRoutes');
 
 // MongoDB ga ulanish
 connectDB();
@@ -30,6 +31,10 @@ app.use('/api/steps', stepRoutes); // <--- Step Counter route'i ulandi
 app.use('/api/gyms', gymRoutes);
 app.use('/api/goals', goalRoutes);
 app.use('/api/insights', insightRoutes)
+app.use(
+  '/api/notifications',
+  notificationRoutes
+);
 
 // Test endpoint
 app.get('/', (req, res) => {
