@@ -1,5 +1,4 @@
  const { GoogleGenAI } = require('@google/genai')
-
 const AITrainer = require('../models/AiTrainer')
 
 // ============================================================
@@ -17,19 +16,30 @@ const getAI = () => {
 }
 
 // ============================================================
-// GEMINI MODEL FALLBACK
+// GEMINI MODELS
 // ============================================================
 
 const AI_MODELS = [
   'gemini-3.8-flash',
   'gemini-3.7-flash',
+  'gemini-3.6-flash',
   'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-2.5-flash',
 ]
 
+// ============================================================
+// TEMPORARY ERROR CHECK
+// ============================================================
+
 const isTemporaryGeminiError = (error) => {
-  const status = error?.status
+  const status =
+    error?.status ||
+    error?.statusCode ||
+    error?.response?.status
 
   return (
+    status === 408 ||
     status === 429 ||
     status === 500 ||
     status === 502 ||
@@ -38,59 +48,106 @@ const isTemporaryGeminiError = (error) => {
   )
 }
 
+// ============================================================
+// WAIT
+// ============================================================
+
+const sleep = (ms) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+
+// ============================================================
+// GEMINI FALLBACK
+// ============================================================
+
 const generateWithFallback = async (
   ai,
   contents,
   config = undefined,
   options = {}
 ) => {
-  const { logPrefix = 'Gemini' } = options
+  const {
+    logPrefix = 'Gemini',
+    retriesPerModel = 2,
+  } = options
 
   let lastError = null
 
   for (const model of AI_MODELS) {
-    try {
-      console.log(`${logPrefix}: trying model ${model}`)
+    for (
+      let attempt = 1;
+      attempt <= retriesPerModel;
+      attempt++
+    ) {
+      try {
+        console.log(
+          `${logPrefix}: trying ${model} (attempt ${attempt}/${retriesPerModel})`
+        )
 
-      const request = {
-        model,
-        contents,
-      }
-
-      if (config) {
-        request.config = config
-      }
-
-      const response =
-        await ai.models.generateContent(request)
-
-      console.log(
-        `${logPrefix}: success with ${model}`
-      )
-
-      return response
-    } catch (error) {
-      lastError = error
-
-      console.error(
-        `${logPrefix}: ${model} failed`,
-        {
-          status: error?.status,
-          message: error?.message,
+        const request = {
+          model,
+          contents,
         }
-      )
 
-      if (!isTemporaryGeminiError(error)) {
-        throw error
+        if (config) {
+          request.config = config
+        }
+
+        const response =
+          await ai.models.generateContent(request)
+
+        const text =
+          response?.text?.trim?.() || ''
+
+        if (!text) {
+          throw new Error(
+            `${model} returned an empty response`
+          )
+        }
+
+        console.log(
+          `${logPrefix}: SUCCESS with ${model}`
+        )
+
+        return response
+      } catch (error) {
+        lastError = error
+
+        const status =
+          error?.status ||
+          error?.statusCode ||
+          error?.response?.status
+
+        console.error(
+          `${logPrefix}: ${model} failed`,
+          {
+            attempt,
+            status,
+            message: error?.message,
+          }
+        )
+
+        // Agar xato temporary bo'lmasa,
+        // boshqa modelga o'tish shart emas.
+        if (!isTemporaryGeminiError(error)) {
+          throw error
+        }
+
+        // Oxirgi urinish bo'lmasa, shu modelni qayta sinaymiz.
+        if (attempt < retriesPerModel) {
+          await sleep(800 * attempt)
+        }
       }
-
-      console.log(
-        `${logPrefix}: trying next model...`
-      )
     }
+
+    console.log(
+      `${logPrefix}: moving to next model...`
+    )
   }
 
-  throw lastError
+  throw lastError ||
+    new Error('Gemini models are temporarily unavailable')
 }
 
 // ============================================================
@@ -103,10 +160,14 @@ exports.analyzeFood = async (req, res) => {
       image,
       imageBase64,
       foodName,
-    } = req.body
+    } = req.body || {}
 
     const imageData =
       image || imageBase64
+
+    // --------------------------------------------------------
+    // IMAGE CHECK
+    // --------------------------------------------------------
 
     if (!imageData) {
       return res.status(400).json({
@@ -126,13 +187,9 @@ exports.analyzeFood = async (req, res) => {
       })
     }
 
-    const ai = getAI()
-
-    const base64Data =
-      imageData.replace(
-        /^data:image\/[\w.+-]+;base64,/,
-        ''
-      )
+    // --------------------------------------------------------
+    // IMAGE DATA
+    // --------------------------------------------------------
 
     const mimeMatch =
       imageData.match(
@@ -142,15 +199,36 @@ exports.analyzeFood = async (req, res) => {
     const mimeType =
       mimeMatch?.[1] || 'image/jpeg'
 
+    const base64Data =
+      imageData.replace(
+        /^data:image\/[\w.+-]+;base64,/,
+        ''
+      )
+
+    if (!base64Data) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Rasm maʼlumotlari bo‘sh',
+      })
+    }
+
+    // --------------------------------------------------------
+    // AI
+    // --------------------------------------------------------
+
+    const ai = getAI()
+
     const prompt = `
 You are the food vision and nutrition analysis AI for the INTIZOM AI application.
 
 Your task is to identify the food shown in the image and estimate the nutrition of the VISIBLE PORTION.
 
 IMPORTANT:
+
 INTIZOM AI is used by users in Uzbekistan and Central Asia.
 
-You MUST recognize and consider Uzbek, Central Asian, and regional cuisine before assuming the food is a generic international dish.
+You MUST recognize and consider Uzbek, Central Asian and regional cuisine before assuming the food is a generic international dish.
 
 Examples include:
 
@@ -174,16 +252,18 @@ Examples include:
 - Qovurma
 - Kuksi
 - Achichuk
-- Various rice dishes
-- Various meat and dough dishes
+- Rice dishes
+- Meat dishes
+- Dough dishes
 - Central Asian soups
 - Central Asian dumplings
 - Central Asian grilled meat
 - Central Asian breads and pastries
 
-Do not automatically classify an Uzbek/Central Asian dish as a generic Western food.
+Do not automatically classify an Uzbek or Central Asian dish as a generic Western food.
 
-For example:
+Examples:
+
 - Osh/plov should be recognized as plov/osh when appropriate.
 - Manti should be recognized as manti rather than generic dumplings.
 - Somsa should be recognized as somsa/samsa rather than generic pastry.
@@ -197,14 +277,15 @@ Consider:
 1. Visible food type
 2. Approximate portion size
 3. Visible ingredients
-4. Amount of rice, noodles, dough, meat, vegetables and other ingredients
+4. Amount of rice, noodles, dough, meat and vegetables
 5. Visible oil or fatty ingredients
-6. Typical preparation methods for the identified dish
-7. Whether the portion appears small, medium, or large
+6. Typical preparation methods
+7. Whether the portion appears small, medium or large
 
-Do NOT pretend that image-based nutrition estimation is 100% exact.
+Do NOT pretend image-based nutrition estimation is 100% exact.
 
 Nutrition values are estimates because:
+
 - exact ingredients may not be visible
 - cooking oil may be hidden
 - portion size may be uncertain
@@ -212,18 +293,25 @@ Nutrition values are estimates because:
 
 When uncertain, provide the most reasonable estimate based on the visible portion.
 
-If the food is an Uzbek or Central Asian dish, use realistic nutritional assumptions for the typical preparation of that dish.
+If the food is an Uzbek or Central Asian dish, use realistic nutritional assumptions for typical preparation.
+
+Do NOT calculate a daily calorie target.
+
+Do NOT provide weight-loss advice.
 
 Return ONLY valid JSON.
 
 Do NOT use Markdown.
+
 Do NOT use code fences.
+
 Do NOT add explanations outside JSON.
+
 Do NOT include percentages.
 
 Nutrition values must be numeric.
+
 Calories must represent the visible portion.
-Do not provide a daily calorie target.
 
 Return exactly this structure:
 
@@ -244,11 +332,16 @@ The user also entered this possible food name:
 "${foodName}"
 
 Use it as an additional clue, but compare it with the image.
+
 If the image clearly shows something different, prioritize the visual evidence.
 `
     : ''
 }
 `
+
+    // --------------------------------------------------------
+    // GEMINI REQUEST
+    // --------------------------------------------------------
 
     const response =
       await generateWithFallback(
@@ -262,14 +355,21 @@ If the image clearly shows something different, prioritize the visual evidence.
           },
           prompt,
         ],
-        undefined,
+        {
+          responseMimeType: 'application/json',
+        },
         {
           logPrefix: 'AI Food Scanner',
+          retriesPerModel: 2,
         }
       )
 
+    // --------------------------------------------------------
+    // RESPONSE
+    // --------------------------------------------------------
+
     const rawText =
-      response.text?.trim()
+      response?.text?.trim?.() || ''
 
     if (!rawText) {
       return res.status(500).json({
@@ -278,6 +378,10 @@ If the image clearly shows something different, prioritize the visual evidence.
           'Gemini AI bo‘sh javob qaytardi',
       })
     }
+
+    // --------------------------------------------------------
+    // CLEAN JSON
+    // --------------------------------------------------------
 
     const cleanJson =
       rawText
@@ -302,8 +406,11 @@ If the image clearly shows something different, prioritize the visual evidence.
         JSON.parse(cleanJson)
     } catch (parseError) {
       console.error(
-        'Gemini JSON parse error:',
-        parseError
+        'AI Scanner JSON parse error:',
+        {
+          rawText,
+          error: parseError?.message,
+        }
       )
 
       return res.status(500).json({
@@ -313,57 +420,78 @@ If the image clearly shows something different, prioritize the visual evidence.
       })
     }
 
+    // --------------------------------------------------------
+    // NORMALIZE NUMBERS
+    // --------------------------------------------------------
+
     const calories =
-      Number(resultData.calories)
+      Number(resultData?.calories)
 
     const carbs =
       Number(
-        resultData.carbs ??
-          resultData.carbohydrates
+        resultData?.carbs ??
+        resultData?.carbohydrates
       )
 
     const protein =
-      Number(resultData.protein)
+      Number(resultData?.protein)
 
     const fat =
-      Number(resultData.fat)
+      Number(resultData?.fat)
 
     const result = {
       name:
-        resultData.name ||
-        resultData.foodName ||
-        resultData.food ||
-        resultData.dishName ||
+        resultData?.name ||
+        resultData?.foodName ||
+        resultData?.food ||
+        resultData?.dishName ||
         'Unknown food',
 
       portion:
-        resultData.portion ||
-        resultData.portionSize ||
+        resultData?.portion ||
+        resultData?.portionSize ||
         'Unknown portion',
 
       calories:
         Number.isFinite(calories)
-          ? Math.max(0, Math.round(calories))
+          ? Math.max(
+              0,
+              Math.round(calories)
+            )
           : 0,
 
       carbs:
         Number.isFinite(carbs)
-          ? Math.max(0, Math.round(carbs))
+          ? Math.max(
+              0,
+              Math.round(carbs)
+            )
           : 0,
 
       protein:
         Number.isFinite(protein)
-          ? Math.max(0, Math.round(protein))
+          ? Math.max(
+              0,
+              Math.round(protein)
+            )
           : 0,
 
       fat:
         Number.isFinite(fat)
-          ? Math.max(0, Math.round(fat))
+          ? Math.max(
+              0,
+              Math.round(fat)
+            )
           : 0,
     }
 
+    // --------------------------------------------------------
+    // RESULT VALIDATION
+    // --------------------------------------------------------
+
     if (
       !result.name ||
+      result.name === 'Unknown food' ||
       result.calories <= 0
     ) {
       return res.status(500).json({
@@ -374,6 +502,10 @@ If the image clearly shows something different, prioritize the visual evidence.
       })
     }
 
+    // --------------------------------------------------------
+    // SUCCESS
+    // --------------------------------------------------------
+
     return res.status(200).json({
       success: true,
       data: result,
@@ -381,7 +513,13 @@ If the image clearly shows something different, prioritize the visual evidence.
   } catch (error) {
     console.error(
       'AI food analysis error:',
-      error
+      {
+        status:
+          error?.status ||
+          error?.statusCode ||
+          error?.response?.status,
+        message: error?.message,
+      }
     )
 
     return res.status(500).json({
@@ -401,8 +539,9 @@ exports.chatWithAI = async (
   res
 ) => {
   try {
-    const { message } =
-      req.body
+    const {
+      message,
+    } = req.body || {}
 
     if (
       !message ||
@@ -444,6 +583,7 @@ Give practical, simple and friendly answers.
 Do not calculate or prescribe personal daily calorie targets from body measurements.
 
 Do not recommend:
+
 - starvation
 - extreme dieting
 - dangerous weight loss
@@ -459,18 +599,35 @@ The user may be a teenager, so avoid restrictive dieting and aggressive weight-l
         },
         {
           logPrefix: 'AI Chat',
+          retriesPerModel: 2,
         }
       )
 
+    const reply =
+      response?.text?.trim?.() || ''
+
+    if (!reply) {
+      return res.status(500).json({
+        success: false,
+        message:
+          'AI Chat bo‘sh javob qaytardi',
+      })
+    }
+
     return res.status(200).json({
       success: true,
-      reply:
-        response.text || '',
+      reply,
     })
   } catch (error) {
     console.error(
       'AI Chat error:',
-      error
+      {
+        status:
+          error?.status ||
+          error?.statusCode ||
+          error?.response?.status,
+        message: error?.message,
+      }
     )
 
     return res.status(500).json({
@@ -564,9 +721,11 @@ Current focus:
 ${safeFocus}
 
 IMPORTANT:
+
 Do NOT use or request body measurements.
 
 Do NOT calculate:
+
 - BMR
 - daily calorie targets
 - calorie deficits
@@ -627,11 +786,12 @@ Return only the plan text.
         undefined,
         {
           logPrefix: 'AI Trainer',
+          retriesPerModel: 2,
         }
       )
 
     const plan =
-      response.text?.trim() || ''
+      response?.text?.trim?.() || ''
 
     if (!plan) {
       return res.status(500).json({
@@ -640,6 +800,10 @@ Return only the plan text.
           'AI Trainer bo‘sh javob qaytardi',
       })
     }
+
+    // --------------------------------------------------------
+    // SAVE TRAINER PLAN
+    // --------------------------------------------------------
 
     const savedTrainer =
       await AITrainer.findOneAndUpdate(
@@ -686,7 +850,13 @@ Return only the plan text.
   } catch (error) {
     console.error(
       'AI Trainer error:',
-      error
+      {
+        status:
+          error?.status ||
+          error?.statusCode ||
+          error?.response?.status,
+        message: error?.message,
+      }
     )
 
     return res.status(500).json({
